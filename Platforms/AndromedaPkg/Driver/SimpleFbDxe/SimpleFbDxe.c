@@ -37,7 +37,10 @@
  *                 region to 1 MiB, so BufferBase/BufferSize are provided
  *                 1 MiB aligned to avoid it shrinking the region.
  *   - PixelFormat (+0x4c) must be 4 or 8.
- *   - DisplayIndex(+0x38) must be 1..16.
+ *   - DisplayIndex(+0x38): values 1..16 override the KMD's internal default
+ *                 (16) of a packed config word; anything else is logged and
+ *                 ignored (not fatal). Its real meaning is unknown, so it is
+ *                 left at 0 here to keep the KMD's default behaviour.
  * Field names below that are marked (inferred) come from how DisplayDxe fills
  * them and how the KMD consumes them; they have not been confirmed on device.
  */
@@ -60,7 +63,7 @@ typedef struct {
   UINT32 Reserved1;     // 0x28
   UINT32 Present;       // 0x2c: (inferred) display present flag
   UINT32 Reserved2[2];  // 0x30
-  UINT32 DisplayIndex;  // 0x38: 1..16
+  UINT32 DisplayIndex;  // 0x38: 1..16 overrides KMD default, else ignored
   UINT64 BufferBase;    // 0x3c: UEFI buffer physical base
   UINT64 BufferSize;    // 0x44: UEFI buffer size
   UINT32 PixelFormat;   // 0x4c: 4 or 8
@@ -160,7 +163,7 @@ SetupUefiDisplayInfo(
   mUefiDisplayInfo.Height       = Height;
   mUefiDisplayInfo.PitchBytes   = Width * (BitsPerPixel / 8);
   mUefiDisplayInfo.Present      = 1;
-  mUefiDisplayInfo.DisplayIndex = 1;
+  mUefiDisplayInfo.DisplayIndex = 0; /* unknown meaning: keep KMD default */
   mUefiDisplayInfo.BufferBase   = (UINT64)FrameBufferBase;
   mUefiDisplayInfo.BufferSize   = BufferSize;
   mUefiDisplayInfo.PixelFormat  = 4;
