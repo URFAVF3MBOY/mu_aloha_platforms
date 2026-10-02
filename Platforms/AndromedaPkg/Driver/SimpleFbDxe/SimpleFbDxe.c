@@ -129,7 +129,7 @@ VOID
 EFIAPI
 VariableWriteNotify(IN EFI_EVENT Event, IN VOID *Context)
 {
-  UNREFERENCED_PARAMETER(Context);
+  (VOID)Context;
 
   if (!EFI_ERROR(PublishUefiDisplayInfo())) {
     gBS->CloseEvent(Event);
