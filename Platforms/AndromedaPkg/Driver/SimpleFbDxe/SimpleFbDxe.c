@@ -15,6 +15,175 @@
 #include <Library/UefiLib.h>
 
 #include <Protocol/GraphicsOutput.h>
+#include <Protocol/VariableWrite.h>
+
+/*
+ * UEFIDisplayInfo
+ *
+ * Qualcomm's DisplayDxe normally publishes this variable so the Windows
+ * Adreno KMD (qcdxkm8150.sys) can inherit the UEFI frame buffer. DisplayDxe is
+ * not part of this build (SimpleFbDxe is used instead), so without this the
+ * KMD still starts but finds no UEFI display buffer and the panel stays dark.
+ *
+ * Contract (recovered from qcdxkm8150.sys 27.20.2140.0 and DisplayDxe.efi):
+ *   - Variable  : L"UEFIDisplayInfo"
+ *   - GUID      : {9042a9de-23dc-4a38-96fb-7aded080516a}
+ *   - Attributes: BOOTSERVICE_ACCESS | RUNTIME_ACCESS (value 6, volatile)
+ *   - Size      : exactly 0x78 bytes, otherwise the KMD rejects it
+ *   - byte[1]   : must be 1 (hard failure otherwise)
+ *   - byte[0]   : expected 5 (mismatch only logs; gates optional fields >= 3/4)
+ *   - FbSizeBytes (+0x14) must be non-zero (KMD returns failure on zero)
+ *   - BufferSize  (+0x44) must be >= 2 MiB and < 4 GiB; the KMD rounds the
+ *                 region to 1 MiB, so BufferBase/BufferSize are provided
+ *                 1 MiB aligned to avoid it shrinking the region.
+ *   - PixelFormat (+0x4c) must be 4 or 8.
+ *   - DisplayIndex(+0x38) must be 1..16.
+ * Field names below that are marked (inferred) come from how DisplayDxe fills
+ * them and how the KMD consumes them; they have not been confirmed on device.
+ */
+STATIC EFI_GUID mUefiDisplayInfoGuid = {
+    0x9042a9de,
+    0x23dc,
+    0x4a38,
+    {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+
+#pragma pack(1)
+typedef struct {
+  UINT32 Version;       // 0x00: DisplayDxe writes 0x00AA0105 ([0]=5, [1]=1)
+  UINT32 Reserved0[3];  // 0x04
+  UINT32 FbAddress32;   // 0x10: (inferred) frame buffer address, low 32 bits
+  UINT32 FbSizeBytes;   // 0x14: frame buffer size in bytes, must be != 0
+  UINT32 BitsPerPixel;  // 0x18: (inferred)
+  UINT32 Width;         // 0x1c: (inferred)
+  UINT32 Height;        // 0x20: (inferred)
+  UINT32 PitchBytes;    // 0x24: (inferred)
+  UINT32 Reserved1;     // 0x28
+  UINT32 Present;       // 0x2c: (inferred) display present flag
+  UINT32 Reserved2[2];  // 0x30
+  UINT32 DisplayIndex;  // 0x38: 1..16
+  UINT64 BufferBase;    // 0x3c: UEFI buffer physical base
+  UINT64 BufferSize;    // 0x44: UEFI buffer size
+  UINT32 PixelFormat;   // 0x4c: 4 or 8
+  UINT8  Reserved3[0x78 - 0x50];
+} UEFI_DISPLAY_INFO;
+#pragma pack()
+
+STATIC_ASSERT(sizeof(UEFI_DISPLAY_INFO) == 0x78, "UEFIDisplayInfo must be 0x78 bytes");
+
+#define UEFI_DISPLAY_INFO_VERSION 0x00AA0105
+#define UEFI_DISPLAY_INFO_ALIGN SIZE_1MB
+
+STATIC EFI_RUNTIME_SERVICES *mRuntimeServices;
+STATIC UEFI_DISPLAY_INFO     mUefiDisplayInfo;
+STATIC BOOLEAN               mUefiDisplayInfoReady;
+STATIC BOOLEAN               mUefiDisplayInfoPublished;
+STATIC EFI_EVENT             mVariableWriteEvent;
+STATIC VOID                 *mVariableWriteRegistration;
+
+/*
+ * Publish the variable once the variable write service is available.
+ * SimpleFbDxe can be dispatched before the variable driver has finished
+ * initialising (it is in APRIORI), so this is retried from a protocol notify.
+ */
+STATIC
+EFI_STATUS
+PublishUefiDisplayInfo(VOID)
+{
+  EFI_STATUS Status;
+  VOID      *VariableWrite;
+
+  if (mUefiDisplayInfoPublished) {
+    return EFI_SUCCESS;
+  }
+
+  if (!mUefiDisplayInfoReady || mRuntimeServices == NULL) {
+    return EFI_NOT_READY;
+  }
+
+  Status = gBS->LocateProtocol(
+      &gEfiVariableWriteArchProtocolGuid, NULL, &VariableWrite);
+  if (EFI_ERROR(Status)) {
+    return EFI_NOT_READY;
+  }
+
+  Status = mRuntimeServices->SetVariable(
+      L"UEFIDisplayInfo", &mUefiDisplayInfoGuid,
+      EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+      sizeof(mUefiDisplayInfo), &mUefiDisplayInfo);
+
+  DEBUG(
+      (EFI_D_INFO, "SimpleFbDxe: UEFIDisplayInfo SetVariable: %r\n", Status));
+
+  if (!EFI_ERROR(Status)) {
+    mUefiDisplayInfoPublished = TRUE;
+  }
+
+  return Status;
+}
+
+STATIC
+VOID
+EFIAPI
+VariableWriteNotify(IN EFI_EVENT Event, IN VOID *Context)
+{
+  UNREFERENCED_PARAMETER(Context);
+
+  if (!EFI_ERROR(PublishUefiDisplayInfo())) {
+    gBS->CloseEvent(Event);
+    mVariableWriteEvent = NULL;
+  }
+}
+
+STATIC
+VOID
+SetupUefiDisplayInfo(
+    IN EFI_SYSTEM_TABLE *SystemTable, IN EFI_PHYSICAL_ADDRESS FrameBufferBase,
+    IN UINT32 FrameBufferSize, IN UINT64 RegionLength, IN UINT32 Width,
+    IN UINT32 Height, IN UINT32 BitsPerPixel)
+{
+  UINT64 BufferSize;
+
+  mRuntimeServices = SystemTable->RuntimeServices;
+
+  /* Report the region 1 MiB aligned, never beyond what is reserved. */
+  BufferSize = ALIGN_VALUE((UINT64)FrameBufferSize, UEFI_DISPLAY_INFO_ALIGN);
+  if (RegionLength != 0 && BufferSize > RegionLength) {
+    BufferSize = RegionLength;
+  }
+
+  ZeroMem(&mUefiDisplayInfo, sizeof(mUefiDisplayInfo));
+  mUefiDisplayInfo.Version      = UEFI_DISPLAY_INFO_VERSION;
+  mUefiDisplayInfo.FbAddress32  = (UINT32)FrameBufferBase;
+  mUefiDisplayInfo.FbSizeBytes  = FrameBufferSize;
+  mUefiDisplayInfo.BitsPerPixel = BitsPerPixel;
+  mUefiDisplayInfo.Width        = Width;
+  mUefiDisplayInfo.Height       = Height;
+  mUefiDisplayInfo.PitchBytes   = Width * (BitsPerPixel / 8);
+  mUefiDisplayInfo.Present      = 1;
+  mUefiDisplayInfo.DisplayIndex = 1;
+  mUefiDisplayInfo.BufferBase   = (UINT64)FrameBufferBase;
+  mUefiDisplayInfo.BufferSize   = BufferSize;
+  mUefiDisplayInfo.PixelFormat  = 4;
+  mUefiDisplayInfoReady         = TRUE;
+
+  if (!EFI_ERROR(PublishUefiDisplayInfo())) {
+    return;
+  }
+
+  /* Variable services not up yet: publish as soon as they are. */
+  if (!EFI_ERROR(gBS->CreateEvent(
+          EVT_NOTIFY_SIGNAL, TPL_CALLBACK, VariableWriteNotify, NULL,
+          &mVariableWriteEvent)) &&
+      !EFI_ERROR(gBS->RegisterProtocolNotify(
+          &gEfiVariableWriteArchProtocolGuid, mVariableWriteEvent,
+          &mVariableWriteRegistration))) {
+    return;
+  }
+
+  DEBUG(
+      (EFI_D_ERROR,
+       "SimpleFbDxe: could not arm UEFIDisplayInfo publication\n"));
+}
 
 /// Defines
 /*
@@ -226,6 +395,12 @@ SimpleFbDxeInitialize(
   mDisplay.Mode->SizeOfInfo      = sizeof(EFI_GRAPHICS_OUTPUT_MODE_INFORMATION);
   mDisplay.Mode->FrameBufferBase = FrameBufferAddress;
   mDisplay.Mode->FrameBufferSize = FrameBufferSize;
+
+  /* Hand the frame buffer over to the Windows GPU driver. Never fatal. */
+  SetupUefiDisplayInfo(
+      SystemTable, FrameBufferAddress, FrameBufferSize,
+      DisplayMemoryRegion.Length, MipiFrameBufferWidth, MipiFrameBufferHeight,
+      FB_BITS_PER_PIXEL);
 
   /* Create the FrameBufferBltLib configuration. */
   Status = FrameBufferBltConfigure(
