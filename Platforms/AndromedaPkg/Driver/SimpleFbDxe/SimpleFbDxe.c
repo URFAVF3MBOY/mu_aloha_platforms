@@ -73,9 +73,6 @@ typedef struct {
 
 STATIC_ASSERT(sizeof(UEFI_DISPLAY_INFO) == 0x78, "UEFIDisplayInfo must be 0x78 bytes");
 
-/* 0 = rely on Qualcomm DisplayDxe to publish UEFIDisplayInfo, 1 = publish it here */
-#define PUBLISH_UEFI_DISPLAY_INFO 0
-
 #define UEFI_DISPLAY_INFO_VERSION 0x00AA0105
 #define UEFI_DISPLAY_INFO_ALIGN SIZE_1MB
 
@@ -402,17 +399,11 @@ SimpleFbDxeInitialize(
   mDisplay.Mode->FrameBufferBase = FrameBufferAddress;
   mDisplay.Mode->FrameBufferSize = FrameBufferSize;
 
-  /*
-   * DisplayDxe fallback build: Qualcomm's DisplayDxe publishes UEFIDisplayInfo,
-   * so ours is switched off to avoid two writers. Kept as a constant condition
-   * (not removed) so the static helpers above stay referenced under -Werror.
-   */
-  if (PUBLISH_UEFI_DISPLAY_INFO) {
-    SetupUefiDisplayInfo(
-        SystemTable, FrameBufferAddress, FrameBufferSize,
-        DisplayMemoryRegion.Length, MipiFrameBufferWidth, MipiFrameBufferHeight,
-        FB_BITS_PER_PIXEL);
-  }
+  /* Hand the frame buffer over to the Windows GPU driver. Never fatal. */
+  SetupUefiDisplayInfo(
+      SystemTable, FrameBufferAddress, FrameBufferSize,
+      DisplayMemoryRegion.Length, MipiFrameBufferWidth, MipiFrameBufferHeight,
+      FB_BITS_PER_PIXEL);
 
   /* Create the FrameBufferBltLib configuration. */
   Status = FrameBufferBltConfigure(
