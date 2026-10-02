@@ -1,0 +1,39 @@
+# Build the SB/NOSB UEFI for the OnePlus 7T (hotdogb) only.
+#
+# Put this file at: .github/workflows/sm8150_oneplus_7t.yml
+# Run it from the Actions tab: "SM8150 Oneplus 7T (hotdogb)" -> Run workflow.
+#
+# Unlike sm8150.yml (which builds every SM8150 device in one matrix and cancels
+# the rest as soon as one fails), this builds exactly one device, so another
+# device's failure cannot cancel or block it.
+
+name: SM8150 Oneplus 7T (hotdogb)
+
+on:
+  # Manual only. Add a push trigger here if you want it to run on every commit.
+  workflow_dispatch:
+
+# Indicate that we are running in CI
+env:
+  WM_CI_BUILD: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build SB/NOSB UEFI for oneplus-hotdogb
+        run: bash scripts/ci_setup.sh && ./build_uefi.py -d oneplus-hotdogb
+
+      - name: Upload oneplus-hotdogb artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: uefi-images-hotdogb
+          path: Build/*/ci_artifacts
+          compression-level: 9
+          if-no-files-found: error
